@@ -1,0 +1,23 @@
+[
+  {
+    "id": "post-1",
+    "title": "Stay Curious, Read Widely: Life Advice from Elon Musk",
+    "date": "2025-04-01",
+    "summary": "Elon Muskが語る人生のアドバイス：好奇心を持ち続け、幅広く読書することの重要性について。",
+    "tags": ["Elon Musk", "Life Advice", "Curiosity", "Reading"]
+  },
+  {
+    "id": "post-2",
+    "title": "プログラマーは地球を救う",
+    "date": "2024-12-22",
+    "summary": "プログラミングと学びが社会や地球をより良い方向へと導く可能性について考察します。",
+    "tags": ["プログラミング", "社会貢献", "学び", "テクノロジー"]
+  },
+  {
+    "id": "post-3",
+    "title": "マラソンはコンピューターサイエンスだ",
+    "date": "2024-05-15",
+    "summary": "マラソンのペース配分とLinuxの輻輳制御アルゴリズムの類似点について考察します。",
+    "tags": ["マラソン", "コンピューターサイエンス", "アルゴリズム", "Linux"]
+  }
+] 
