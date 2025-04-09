@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import fs from 'fs/promises'; // 非同期ファイルシステム操作
 import path from 'path';
 
@@ -7,6 +7,21 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.json()); // POSTリクエストのJSONボディをパースする
+
+// CORSヘッダーの設定
+app.use(function(req: Request, res: Response, next: NextFunction) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    
+    // OPTIONSリクエストに対する応答
+    if (req.method === 'OPTIONS') {
+        res.status(200).end();
+        return;
+    }
+    
+    next();
+});
 
 // 静的ファイル配信の設定（アイコン画像など）
 app.use(express.static('public'));
@@ -58,25 +73,35 @@ async function getBlogPostContent(postId: string) {
 
 // --- MCPエンドポイントの実装 ---
 
-// 1. /.well-known/model-context-protocol.json
-// サーバーのメタデータと提供コンテキストを定義
-app.get('/.well-known/model-context-protocol.json', (req: Request, res: Response) => {
-    // サーバー側でSSEリクエストかどうかを判定
-    const acceptHeader = req.get('Accept');
+// SSEのセットアップヘルパー関数
+function setupSSE(req: Request, res: Response): boolean {
+    const acceptHeader = req.get('Accept') || '';
+    const isSseRequest = acceptHeader.includes('text/event-stream');
     
-    // Accept: text/event-stream があれば SSE として応答
-    if (acceptHeader && acceptHeader.includes('text/event-stream')) {
+    if (isSseRequest) {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         
-        // SSE形式でデータを送信
-        const data = getMcpMetadata(req);
+        // SSEのヘッダーとして必要
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders(); // フラッシュしてクライアントに送信
+    }
+    
+    return isSseRequest;
+}
+
+// 1. /.well-known/model-context-protocol.json
+// サーバーのメタデータと提供コンテキストを定義
+app.get('/.well-known/model-context-protocol.json', (req: Request, res: Response) => {
+    const isSseRequest = setupSSE(req, res);
+    const data = getMcpMetadata(req);
+    
+    if (isSseRequest) {
         res.write(`data: ${JSON.stringify(data)}\n\n`);
         res.end();
     } else {
-        // 通常のJSONレスポンス
-        res.json(getMcpMetadata(req));
+        res.json(data);
     }
 });
 
@@ -129,108 +154,104 @@ function getMcpMetadata(req: Request) {
 
 // 2. /mcp エンドポイント
 // 実際のコンテキストデータを返す
-app.route('/mcp').post(async (req: Request, res: Response) => {
-    const { context_id, params } = req.body;
+app.route('/mcp')
+    .options((req: Request, res: Response) => {
+        res.status(200).end();
+    })
+    .post(async (req: Request, res: Response) => {
+        const { context_id, params } = req.body;
+        const isSseRequest = setupSSE(req, res);
 
-    // SSEリクエストチェック
-    const acceptHeader = req.get('Accept');
-    const isSseRequest = acceptHeader && acceptHeader.includes('text/event-stream');
-    
-    if (isSseRequest) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-    }
+        try {
+            if (!context_id) {
+                if (isSseRequest) {
+                    res.write(`data: ${JSON.stringify({ error: "context_id is required" })}\n\n`);
+                    res.end();
+                } else {
+                    res.status(400).json({ error: "context_id is required" });
+                }
+                return;
+            }
 
-    try {
-        if (!context_id) {
+            console.log(`[MCP Request] context_id: ${context_id}, params: ${JSON.stringify(params)}`); // ログ出力
+
+            let content: any = null;
+            let format: string = 'text/plain'; // デフォルト
+
+            switch (context_id) {
+                case 'profile':
+                    // プロフィール情報を取得
+                    const userProfile = await getUserProfile();
+                    
+                    // JSON形式で返す場合
+                    content = JSON.stringify(userProfile);
+                    format = 'application/json';
+                    
+                    // テキスト形式で返す場合
+                    // const profileText = `Name: ${userProfile.name}\nBio: ${userProfile.bio}\nWebsite: ${userProfile.website}`;
+                    // content = profileText;
+                    // format = 'text/plain';
+                    break;
+
+                case 'blog_posts_list':
+                    const posts = await getBlogPosts();
+                    // 記事リストをJSON形式で返す
+                    content = JSON.stringify(posts);
+                    format = 'application/json';
+                    break;
+
+                case 'blog_post_content':
+                    // paramsに必要なパラメータがあるかチェック
+                    if (!params || !params.post_id) {
+                        res.status(400).json({ error: `Missing required parameter 'post_id' for context 'blog_post_content'` });
+                        return;
+                    }
+                    const postId = params.post_id;
+                    content = await getBlogPostContent(postId);
+                    if (content) {
+                        format = 'text/markdown'; // Markdown形式で返す
+                    } else {
+                        // contentがnullの場合 (記事が見つからない)
+                        console.warn(`[MCP Warning] Blog post not found for id: ${postId}`);
+                        // MCPではエラーでなく空の内容を返すのが一般的かもしれないが、ここでは404を返す例
+                        res.status(404).json({ error: `Blog post with id '${postId}' not found` });
+                        return;
+                    }
+                    break;
+
+                default:
+                    // 不明な context_id
+                    console.warn(`[MCP Warning] Unknown context_id requested: ${context_id}`);
+                    res.status(404).json({ error: `Context with id '${context_id}' not found` });
+                    return;
+            }
+
+            // MCPレスポンス形式で返す
+            const responseData = {
+                context: {
+                    content: content,
+                    format: format,
+                },
+            };
+
             if (isSseRequest) {
-                res.write(`data: ${JSON.stringify({ error: "context_id is required" })}\n\n`);
+                console.log(`[MCP Response] Sending SSE response for ${context_id}`);
+                res.write(`data: ${JSON.stringify(responseData)}\n\n`);
                 res.end();
             } else {
-                res.status(400).json({ error: "context_id is required" });
+                res.json(responseData);
             }
-            return;
+
+        } catch (error) {
+            console.error("Error processing /mcp request:", error);
+            if (isSseRequest) {
+                res.write(`data: ${JSON.stringify({ error: "Internal server error" })}\n\n`);
+                res.end();
+            } else {
+                res.status(500).json({ error: "Internal server error" });
+            }
         }
-
-        console.log(`[MCP Request] context_id: ${context_id}, params: ${JSON.stringify(params)}`); // ログ出力
-
-        let content: any = null;
-        let format: string = 'text/plain'; // デフォルト
-
-        switch (context_id) {
-            case 'profile':
-                // プロフィール情報を取得
-                const userProfile = await getUserProfile();
-                
-                // JSON形式で返す場合
-                content = JSON.stringify(userProfile);
-                format = 'application/json';
-                
-                // テキスト形式で返す場合
-                // const profileText = `Name: ${userProfile.name}\nBio: ${userProfile.bio}\nWebsite: ${userProfile.website}`;
-                // content = profileText;
-                // format = 'text/plain';
-                break;
-
-            case 'blog_posts_list':
-                const posts = await getBlogPosts();
-                // 記事リストをJSON形式で返す
-                content = JSON.stringify(posts);
-                format = 'application/json';
-                break;
-
-            case 'blog_post_content':
-                // paramsに必要なパラメータがあるかチェック
-                if (!params || !params.post_id) {
-                    res.status(400).json({ error: `Missing required parameter 'post_id' for context 'blog_post_content'` });
-                    return;
-                }
-                const postId = params.post_id;
-                content = await getBlogPostContent(postId);
-                if (content) {
-                    format = 'text/markdown'; // Markdown形式で返す
-                } else {
-                    // contentがnullの場合 (記事が見つからない)
-                    console.warn(`[MCP Warning] Blog post not found for id: ${postId}`);
-                    // MCPではエラーでなく空の内容を返すのが一般的かもしれないが、ここでは404を返す例
-                    res.status(404).json({ error: `Blog post with id '${postId}' not found` });
-                    return;
-                }
-                break;
-
-            default:
-                // 不明な context_id
-                console.warn(`[MCP Warning] Unknown context_id requested: ${context_id}`);
-                res.status(404).json({ error: `Context with id '${context_id}' not found` });
-                return;
-        }
-
-        // MCPレスポンス形式で返す
-        const responseData = {
-            context: {
-                content: content,
-                format: format,
-            },
-        };
-
-        if (isSseRequest) {
-            res.write(`data: ${JSON.stringify(responseData)}\n\n`);
-            res.end();
-        } else {
-            res.json(responseData);
-        }
-
-    } catch (error) {
-        console.error("Error processing /mcp request:", error);
-        if (isSseRequest) {
-            res.write(`data: ${JSON.stringify({ error: "Internal server error" })}\n\n`);
-            res.end();
-        } else {
-            res.status(500).json({ error: "Internal server error" });
-        }
-    }
-});
+    });
 
 // ルートパスなど他のパスも必要に応じて設定
 app.get('/', (req: Request, res: Response) => {
