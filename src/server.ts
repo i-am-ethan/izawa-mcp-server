@@ -61,12 +61,33 @@ async function getBlogPostContent(postId: string) {
 // 1. /.well-known/model-context-protocol.json
 // サーバーのメタデータと提供コンテキストを定義
 app.get('/.well-known/model-context-protocol.json', (req: Request, res: Response) => {
+    // サーバー側でSSEリクエストかどうかを判定
+    const acceptHeader = req.get('Accept');
+    
+    // Accept: text/event-stream があれば SSE として応答
+    if (acceptHeader && acceptHeader.includes('text/event-stream')) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        
+        // SSE形式でデータを送信
+        const data = getMcpMetadata(req);
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        res.end();
+    } else {
+        // 通常のJSONレスポンス
+        res.json(getMcpMetadata(req));
+    }
+});
+
+// MCPメタデータを生成する関数（コード重複を避けるため）
+function getMcpMetadata(req: Request) {
     // デプロイ先のホスト名を動的に取得する方が望ましい
     const host = req.get('host') || `localhost:${port}`;
     const protocol = req.protocol === 'http' && host.startsWith('localhost') ? 'http' : 'https'; // localhost以外はhttpsを想定
     const rootUrl = `${protocol}://${host}`;
 
-    res.json({
+    return {
         name: 'Izawa MCP Server',
         description: 'プロフィールとブログ記事を提供します。',
         root_url: rootUrl,
@@ -103,17 +124,32 @@ app.get('/.well-known/model-context-protocol.json', (req: Request, res: Response
                 },
             }
         ],
-    });
-});
+    };
+}
 
 // 2. /mcp エンドポイント
 // 実際のコンテキストデータを返す
 app.route('/mcp').post(async (req: Request, res: Response) => {
     const { context_id, params } = req.body;
 
+    // SSEリクエストチェック
+    const acceptHeader = req.get('Accept');
+    const isSseRequest = acceptHeader && acceptHeader.includes('text/event-stream');
+    
+    if (isSseRequest) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+    }
+
     try {
         if (!context_id) {
-            res.status(400).json({ error: "context_id is required" });
+            if (isSseRequest) {
+                res.write(`data: ${JSON.stringify({ error: "context_id is required" })}\n\n`);
+                res.end();
+            } else {
+                res.status(400).json({ error: "context_id is required" });
+            }
             return;
         }
 
@@ -171,16 +207,28 @@ app.route('/mcp').post(async (req: Request, res: Response) => {
         }
 
         // MCPレスポンス形式で返す
-        res.json({
+        const responseData = {
             context: {
                 content: content,
                 format: format,
             },
-        });
+        };
+
+        if (isSseRequest) {
+            res.write(`data: ${JSON.stringify(responseData)}\n\n`);
+            res.end();
+        } else {
+            res.json(responseData);
+        }
 
     } catch (error) {
         console.error("Error processing /mcp request:", error);
-        res.status(500).json({ error: "Internal server error" });
+        if (isSseRequest) {
+            res.write(`data: ${JSON.stringify({ error: "Internal server error" })}\n\n`);
+            res.end();
+        } else {
+            res.status(500).json({ error: "Internal server error" });
+        }
     }
 });
 
